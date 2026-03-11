@@ -39,7 +39,7 @@ Execute the following command to download the example into the `my-project` fold
 npx degit@latest https://github.com/vercel/examples/storage/blob-sveltekit my-project
 ```
 
-Once you've created the project and installed dependencies with `pnpm install`, copy the `.env.example` file in this directory to `.env.local` (which will be ignored by Git). Then open `.env.local` and set the environment variables to match the ones in your Vercel Storage Dashboard.
+Once you've created the project and installed dependencies with `bun install`, copy the `.env.example` file in this directory to `.env.local` (which will be ignored by Git). Then open `.env.local` and set the environment variables to match the ones in your Vercel Storage Dashboard.
 
 Alternatively, if you have setup a project already and you have installed the Vercel CLI, you can also pull the environment variables using the following command:
 
@@ -50,7 +50,7 @@ vercel env pull .env.local
 Next, run SvelteKit in development mode:
 
 ```bash
-pnpm dev
+bun run dev
 ```
 
 Deploy it to the cloud with [Vercel](https://vercel.com/new?utm_source=github&utm_medium=readme&utm_campaign=vercel-examples) ([Documentation](https://vercel.com/docs/frameworks/sveltekit)).

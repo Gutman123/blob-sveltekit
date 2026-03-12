@@ -1,5 +1,3 @@
 {
-  "$schema": "https://openapi.vercel.sh/vercel.json",
-  "buildCommand": "bunx turbo build",
-  "ignoreCommand": "bunx turbo-ignore"
+  "$schema": "https://openapi.vercel.sh/vercel.json"
 }

@@ -10,6 +10,8 @@
   let session = $derived(data.session)
   let user = $derived(data.user)
   let supabase = $derived(data.supabase)
+  let isMember = $derived(data.isMember ?? false)
+  let subscription = $derived(data.subscription ?? null)
 
   async function login() {
     await supabase.auth.signInWithOAuth({
@@ -63,10 +65,18 @@
           onclick={(e) => { e.stopPropagation(); toggleDropdown(); }}
           class="flex items-center space-x-2 rounded-full bg-white/30 px-4 py-2 text-sm font-medium text-gray-700 shadow-sm ring-1 ring-gray-900/5 transition-all hover:bg-white/50 hover:shadow-md focus:outline-none"
         >
-          {#if user.user_metadata?.avatar_url}
-            <img src={user.user_metadata.avatar_url} alt="User Avatar" class="h-6 w-6 rounded-full" />
-          {/if}
+          <div class="relative">
+            {#if user.user_metadata?.avatar_url}
+              <img src={user.user_metadata.avatar_url} alt="User Avatar" class="h-6 w-6 rounded-full" />
+            {/if}
+            {#if isMember}
+              <span class="absolute -bottom-1 -right-1 text-[9px] leading-none">💎</span>
+            {/if}
+          </div>
           <span>{user.user_metadata?.full_name || user.email || 'User'}</span>
+          {#if isMember}
+            <span class="text-xs font-semibold px-1.5 py-0.5 rounded-full" style="background: rgba(229,231,235,0.2); color: #c4b5fd">白金</span>
+          {/if}
           <svg class="h-4 w-4 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
           </svg>
@@ -77,6 +87,15 @@
             <div class="px-4 py-2 text-xs text-gray-500 dark:text-gray-400 border-b border-gray-100 dark:border-zinc-700/50 mb-1">
               Signed in as<br/>
               <span class="font-medium text-gray-900 dark:text-white truncate block mt-0.5">{user.email}</span>
+              {#if isMember && subscription?.current_period_end}
+                <span class="inline-flex items-center gap-1 mt-1.5 px-2 py-0.5 rounded-full text-[10px] font-semibold" style="background: rgba(139,92,246,0.15); color: #a78bfa; border: 1px solid rgba(139,92,246,0.3)">
+                  💎 白金会员 · 到期 {new Date(subscription.current_period_end).toLocaleDateString('zh-CN', { year: 'numeric', month: 'short', day: 'numeric' })}
+                </span>
+              {:else if isMember}
+                <span class="inline-flex items-center gap-1 mt-1.5 px-2 py-0.5 rounded-full text-[10px] font-semibold" style="background: rgba(139,92,246,0.15); color: #a78bfa; border: 1px solid rgba(139,92,246,0.3)">
+                  💎 白金会员
+                </span>
+              {/if}
             </div>
             <a href="/profile" class="block px-4 py-2 text-sm text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-zinc-700 transition-colors" onclick={closeDropdown}>
               <div class="flex items-center space-x-2">

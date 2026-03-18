@@ -35,5 +35,12 @@ export const load: LayoutLoad = async ({ data, depends, fetch }) => {
     data: { user },
   } = await supabase.auth.getUser()
 
-  return { session, supabase, user }
+  return {
+    session,
+    supabase,
+    user,
+    // 透传服务端已计算好的会员状态（仅在首次 SSR 时由服务端查询，CSR 导航时复用缓存）
+    subscription: data.subscription ?? null,
+    isMember: data.isMember ?? false,
+  }
 }

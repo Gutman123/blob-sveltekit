@@ -35,6 +35,8 @@
       data: { subscription },
     } = supabase.auth.onAuthStateChange((event, newSession) => {
       if (newSession?.expires_at !== data.session?.expires_at) {
+        // 使 supabase:auth 依赖失效，触发 +layout.server.ts 重新查询
+        // 这样登录/登出后，subscription 和 isMember 都会自动更新
         invalidate('supabase:auth')
       }
     })

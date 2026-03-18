@@ -1,12 +1,15 @@
 import { redirect, fail } from '@sveltejs/kit'
 import type { PageServerLoad, Actions } from './$types'
 
-export const load: PageServerLoad = async ({ locals: { safeGetSession, supabase } }) => {
+export const load: PageServerLoad = async ({ locals: { safeGetSession, supabase }, parent }) => {
   const { session, user } = await safeGetSession()
 
   if (!session || !user) {
     redirect(303, '/')
   }
+
+  // 从 layout 获取已查好的会员状态（避免重复查询）
+  const { subscription, isMember } = await parent()
 
   // Try to fetch profile from profiles table; ignore if it doesn't exist yet
   const { data: profile } = await supabase
@@ -19,6 +22,8 @@ export const load: PageServerLoad = async ({ locals: { safeGetSession, supabase 
     user,
     session,
     profile: profile ?? null,
+    subscription,
+    isMember,
   }
 }
 

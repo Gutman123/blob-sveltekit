@@ -121,22 +121,46 @@ export const POST: RequestHandler = async ({ request }) => {
     }
 
     // ✅ Fix 4: Creem uses "current_period_start_date" and "current_period_end_date" (with _date suffix)
-    const periodStart: string =
+    const creemPeriodStart: string =
       (subscription?.current_period_start_date as string) ??
       (subscription?.current_period_start as string) ??
       new Date().toISOString()
 
-    let periodEnd: string
+    let creemPeriodEnd: string
     if (subscription?.current_period_end_date) {
-      periodEnd = subscription.current_period_end_date as string
+      creemPeriodEnd = subscription.current_period_end_date as string
     } else if (subscription?.current_period_end) {
-      periodEnd = subscription.current_period_end as string
+      creemPeriodEnd = subscription.current_period_end as string
     } else {
       // Fallback: infer from product billing_period
       const product = obj.product as Record<string, unknown> | undefined
       const billingPeriod = (product?.billing_period as string) ?? ''
       const isAnnual = /year|annual/i.test(billingPeriod)
-      periodEnd = new Date(Date.now() + (isAnnual ? 365 : 30) * 86_400_000).toISOString()
+      creemPeriodEnd = new Date(Date.now() + (isAnnual ? 365 : 30) * 86_400_000).toISOString()
+    }
+
+    // Stack membership duration if the user already has an active subscription
+    const { data: existingSub } = await supabase
+      .from('subscriptions')
+      .select('current_period_end')
+      .eq('user_id', userId)
+      .single()
+
+    const nowMs = Date.now()
+    const existingEndMs = existingSub?.current_period_end ? new Date(existingSub.current_period_end).getTime() : 0
+
+    let periodStart = creemPeriodStart
+    let periodEnd = creemPeriodEnd
+
+    if (existingEndMs > nowMs) {
+      let addedDurationMs = new Date(creemPeriodEnd).getTime() - new Date(creemPeriodStart).getTime()
+      if (addedDurationMs <= 0 || isNaN(addedDurationMs)) {
+        const product = obj.product as Record<string, unknown> | undefined
+        const billingPeriod = (product?.billing_period as string) ?? ''
+        const isAnnual = /year|annual/i.test(billingPeriod)
+        addedDurationMs = (isAnnual ? 365 : 30) * 86_400_000
+      }
+      periodEnd = new Date(existingEndMs + addedDurationMs).toISOString()
     }
 
     // creem_checkout_id from obj.id (the checkout object's own id)
@@ -192,10 +216,32 @@ export const POST: RequestHandler = async ({ request }) => {
       return json({ received: true, warning: 'no user_id' })
     }
 
-    const periodEnd: string =
+    const creemPeriodStart: string =
+      (obj.current_period_start_date as string) ??
+      (obj.current_period_start as string) ??
+      new Date().toISOString()
+
+    const creemPeriodEnd: string =
       (obj.current_period_end_date as string) ??
       (obj.current_period_end as string) ??
       new Date(Date.now() + 30 * 86_400_000).toISOString()
+
+    const { data: existingSub } = await supabase
+      .from('subscriptions')
+      .select('current_period_end')
+      .eq('user_id', userId)
+      .single()
+
+    const nowMs = Date.now()
+    const existingEndMs = existingSub?.current_period_end ? new Date(existingSub.current_period_end).getTime() : 0
+
+    let periodEnd = creemPeriodEnd
+
+    if (existingEndMs > nowMs) {
+      let addedDurationMs = new Date(creemPeriodEnd).getTime() - new Date(creemPeriodStart).getTime()
+      if (addedDurationMs <= 0 || isNaN(addedDurationMs)) addedDurationMs = 30 * 86_400_000
+      periodEnd = new Date(existingEndMs + addedDurationMs).toISOString()
+    }
 
     const { error } = await supabase
       .from('subscriptions')
@@ -227,22 +273,38 @@ export const POST: RequestHandler = async ({ request }) => {
     const userId: string | undefined = metadata.user_id
 
     if (userId) {
-      const periodEnd =
+      const creemPeriodEnd =
         (obj.current_period_end_date as string) ??
         (obj.current_period_end as string) ??
         null
 
+      const { data: existingSub } = await supabase
+        .from('subscriptions')
+        .select('current_period_end')
+        .eq('user_id', userId)
+        .single()
+
+      let periodEnd = creemPeriodEnd
+      if (existingSub?.current_period_end && creemPeriodEnd) {
+        const existingEndMs = new Date(existingSub.current_period_end).getTime()
+        const newEndMs = new Date(creemPeriodEnd).getTime()
+        if (existingEndMs > newEndMs) {
+          periodEnd = existingSub.current_period_end
+        }
+      }
+
+      const updateData: any = {
+        user_id: userId,
+        status: (obj.status as string) ?? 'active',
+        updated_at: new Date().toISOString(),
+      }
+      if (periodEnd) {
+        updateData.current_period_end = periodEnd
+      }
+
       await supabase
         .from('subscriptions')
-        .upsert(
-          {
-            user_id: userId,
-            status: (obj.status as string) ?? 'active',
-            current_period_end: periodEnd,
-            updated_at: new Date().toISOString(),
-          },
-          { onConflict: 'user_id' }
-        )
+        .upsert(updateData, { onConflict: 'user_id' })
     }
     return json({ received: true })
   }

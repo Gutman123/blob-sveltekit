@@ -5,14 +5,24 @@ import { PUBLIC_SUPABASE_URL } from '$env/static/public'
 import { SUPABASE_SERVICE_ROLE_KEY, CREEM_WEBHOOK_SECRET } from '$env/static/private'
 
 /**
- * Creem sends webhook events as JSON POST requests.
- * We verify the signature using HMAC-SHA256, then upsert the
- * subscription record into the `subscriptions` table.
+ * Creem Webhook Handler — fixed for actual Creem payload structure:
  *
- * Relevant Creem event types:
- *   - checkout.completed  → new subscription created / renewed
- *   - subscription.updated → plan or status change
- *   - subscription.deleted → cancellation
+ * Real Creem payload shape:
+ * {
+ *   "eventType": "checkout.completed",   ← NOT "type" or "event_type"
+ *   "object": {                           ← NOT "data"
+ *     "id": "ch_xxx",
+ *     "metadata": { "user_id": "..." },
+ *     "customer": { "id": "cust_xxx", ... },
+ *     "subscription": {
+ *       "current_period_start_date": "...",  ← NOT current_period_start
+ *       "current_period_end_date": "...",    ← NOT current_period_end
+ *       "metadata": { "user_id": "..." }
+ *     }
+ *   },
+ *   "id": "evt_xxx",
+ *   "created_at": 1234567890
+ * }
  */
 
 // ---------------------------------------------------------------------------
@@ -40,7 +50,6 @@ async function verifyCreemSignature(
     .map((b) => b.toString(16).padStart(2, '0'))
     .join('')
 
-  // Creem may send header as "sha256=<hex>" or just "<hex>"
   const receivedHex = signatureHeader.startsWith('sha256=')
     ? signatureHeader.slice(7)
     : signatureHeader
@@ -48,7 +57,6 @@ async function verifyCreemSignature(
   return computedHex === receivedHex
 }
 
-// Build a supabase admin client that bypasses RLS
 function adminSupabase() {
   return createClient(PUBLIC_SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
     auth: { persistSession: false },
@@ -61,15 +69,17 @@ function adminSupabase() {
 
 export const POST: RequestHandler = async ({ request }) => {
   const rawBody = await request.text()
-  const signature = request.headers.get('creem-signature') ??
-                    request.headers.get('x-creem-signature') ??
-                    request.headers.get('webhook-signature')
 
-  // --- Signature verification (skip when no secret is configured) ---
+  const signature =
+    request.headers.get('creem-signature') ??
+    request.headers.get('x-creem-signature') ??
+    request.headers.get('webhook-signature')
+
+  // Signature verification (skip only when secret is not configured)
   if (CREEM_WEBHOOK_SECRET) {
     const valid = await verifyCreemSignature(rawBody, signature, CREEM_WEBHOOK_SECRET)
     if (!valid) {
-      console.warn('[creem-webhook] Invalid signature')
+      console.warn('[creem-webhook] Invalid signature, header received:', signature)
       return json({ error: 'Invalid signature' }, { status: 401 })
     }
   }
@@ -81,122 +91,186 @@ export const POST: RequestHandler = async ({ request }) => {
     return json({ error: 'Invalid JSON' }, { status: 400 })
   }
 
-  console.log('[creem-webhook] event:', payload.type ?? payload.event_type)
+  // ✅ Fix 1: Creem uses "eventType", not "type" or "event_type"
+  const eventType = (payload.eventType ?? payload.type ?? payload.event_type) as string | undefined
+  console.log('[creem-webhook] eventType:', eventType)
+  console.log('[creem-webhook] full payload:', JSON.stringify(payload, null, 2))
 
   const supabase = adminSupabase()
 
   // -----------------------------------------------------------------------
   // checkout.completed  →  new paid subscription
   // -----------------------------------------------------------------------
-  if (
-    payload.type === 'checkout.completed' ||
-    payload.event_type === 'checkout.completed'
-  ) {
-    const data = (payload.data ?? payload) as Record<string, unknown>
-    const customer = data.customer as Record<string, unknown> | undefined
-    const subscription = data.subscription as Record<string, unknown> | undefined
-    const checkout = data.checkout as Record<string, unknown> | undefined
+  if (eventType === 'checkout.completed') {
+    // ✅ Fix 2: Creem uses "object" as the top-level data container, not "data"
+    const obj = (payload.object ?? payload.data ?? payload) as Record<string, unknown>
 
-    // Creem attaches your custom metadata (e.g. user_id) to the checkout
-    const metadata = (checkout?.metadata ?? data.metadata ?? {}) as Record<string, string>
-    const userId: string | undefined = metadata.user_id as string | undefined
+    const customer = obj.customer as Record<string, unknown> | undefined
+    const subscription = obj.subscription as Record<string, unknown> | undefined
+
+    // ✅ Fix 3: user_id lives in obj.metadata OR obj.subscription.metadata
+    const metadata = (obj.metadata ?? {}) as Record<string, string>
+    const subMetadata = (subscription?.metadata ?? {}) as Record<string, string>
+    const userId: string | undefined = metadata.user_id ?? subMetadata.user_id
 
     if (!userId) {
-      console.warn('[creem-webhook] checkout.completed missing metadata.user_id')
-      // Still return 200 so Creem does not retry indefinitely
+      console.warn('[creem-webhook] checkout.completed: missing user_id in metadata')
+      console.warn('[creem-webhook] obj.metadata:', obj.metadata)
+      console.warn('[creem-webhook] subscription.metadata:', subscription?.metadata)
       return json({ received: true, warning: 'no user_id in metadata' })
     }
 
-    // Determine period dates from subscription object
-    const periodStart: string = (subscription?.current_period_start as string) ??
+    // ✅ Fix 4: Creem uses "current_period_start_date" and "current_period_end_date" (with _date suffix)
+    const periodStart: string =
+      (subscription?.current_period_start_date as string) ??
+      (subscription?.current_period_start as string) ??
       new Date().toISOString()
 
-    // If no explicit end date, infer from interval (month = 30d, year = 365d)
     let periodEnd: string
-    if (subscription?.current_period_end) {
+    if (subscription?.current_period_end_date) {
+      periodEnd = subscription.current_period_end_date as string
+    } else if (subscription?.current_period_end) {
       periodEnd = subscription.current_period_end as string
     } else {
-      const planId = (subscription?.plan_id ?? data.plan_id ?? '') as string
-      const isAnnual = /year|annual|annu/i.test(planId)
-      const daysToAdd = isAnnual ? 365 : 30
-      periodEnd = new Date(Date.now() + daysToAdd * 86_400_000).toISOString()
+      // Fallback: infer from product billing_period
+      const product = obj.product as Record<string, unknown> | undefined
+      const billingPeriod = (product?.billing_period as string) ?? ''
+      const isAnnual = /year|annual/i.test(billingPeriod)
+      periodEnd = new Date(Date.now() + (isAnnual ? 365 : 30) * 86_400_000).toISOString()
     }
 
-    const { error } = await supabase.from('subscriptions').upsert(
-      {
-        user_id: userId,
-        status: 'active',
-        plan_id: subscription?.plan_id ?? data.plan_id ?? 'platinum',
-        creem_checkout_id: checkout?.id ?? data.id ?? null,
-        creem_customer_id: customer?.id ?? null,
-        current_period_start: periodStart,
-        current_period_end: periodEnd,
-        updated_at: new Date().toISOString(),
-      },
-      { onConflict: 'user_id' }
-    )
+    // creem_checkout_id from obj.id (the checkout object's own id)
+    const creemCheckoutId = (obj.id as string) ?? null
+    const creemCustomerId = (customer?.id as string) ?? null
+
+    // plan_id: use product name or id as fallback
+    const product = obj.product as Record<string, unknown> | undefined
+    const planId = (product?.id as string) ?? (obj.plan_id as string) ?? 'platinum'
+
+    console.log(`[creem-webhook] upserting subscription for user ${userId}`, {
+      periodStart,
+      periodEnd,
+      creemCheckoutId,
+      planId,
+    })
+
+    const { error } = await supabase
+      .from('subscriptions')
+      .upsert(
+        {
+          user_id: userId,
+          status: 'active',
+          plan_id: planId,
+          creem_checkout_id: creemCheckoutId,
+          creem_customer_id: creemCustomerId,
+          current_period_start: periodStart,
+          current_period_end: periodEnd,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: 'user_id' }
+      )
 
     if (error) {
       console.error('[creem-webhook] upsert error:', error)
       return json({ error: error.message }, { status: 500 })
     }
 
-    console.log(`[creem-webhook] ✅ subscription activated for user ${userId}`)
+    console.log(`[creem-webhook] ✅ subscription activated for user ${userId}, expires ${periodEnd}`)
     return json({ received: true })
   }
 
   // -----------------------------------------------------------------------
-  // subscription.updated  →  renewal / plan change
+  // subscription.paid  →  renewal payment succeeded
   // -----------------------------------------------------------------------
-  if (
-    payload.type === 'subscription.updated' ||
-    payload.event_type === 'subscription.updated'
-  ) {
-    const sub = (payload.data ?? payload) as Record<string, unknown>
-    const metadata = (sub.metadata ?? {}) as Record<string, string>
-    const userId: string | undefined = metadata.user_id as string | undefined
+  if (eventType === 'subscription.paid') {
+    const obj = (payload.object ?? payload.data ?? payload) as Record<string, unknown>
+    const metadata = (obj.metadata ?? {}) as Record<string, string>
+    const userId: string | undefined = metadata.user_id
 
-    if (userId) {
-      await supabase.from('subscriptions').upsert(
+    if (!userId) {
+      console.warn('[creem-webhook] subscription.paid: missing user_id')
+      return json({ received: true, warning: 'no user_id' })
+    }
+
+    const periodEnd: string =
+      (obj.current_period_end_date as string) ??
+      (obj.current_period_end as string) ??
+      new Date(Date.now() + 30 * 86_400_000).toISOString()
+
+    const { error } = await supabase
+      .from('subscriptions')
+      .upsert(
         {
           user_id: userId,
-          status: (sub.status as string) ?? 'active',
-          plan_id: sub.plan_id ?? 'platinum',
-          creem_customer_id: sub.customer_id ?? null,
-          current_period_start: sub.current_period_start ?? new Date().toISOString(),
-          current_period_end: sub.current_period_end ?? null,
+          status: 'active',
+          current_period_end: periodEnd,
           updated_at: new Date().toISOString(),
         },
         { onConflict: 'user_id' }
       )
+
+    if (error) {
+      console.error('[creem-webhook] subscription.paid upsert error:', error)
+      return json({ error: error.message }, { status: 500 })
+    }
+
+    console.log(`[creem-webhook] ✅ subscription renewed for user ${userId}, expires ${periodEnd}`)
+    return json({ received: true })
+  }
+
+  // -----------------------------------------------------------------------
+  // subscription.updated  →  plan or status change
+  // -----------------------------------------------------------------------
+  if (eventType === 'subscription.updated') {
+    const obj = (payload.object ?? payload.data ?? payload) as Record<string, unknown>
+    const metadata = (obj.metadata ?? {}) as Record<string, string>
+    const userId: string | undefined = metadata.user_id
+
+    if (userId) {
+      const periodEnd =
+        (obj.current_period_end_date as string) ??
+        (obj.current_period_end as string) ??
+        null
+
+      await supabase
+        .from('subscriptions')
+        .upsert(
+          {
+            user_id: userId,
+            status: (obj.status as string) ?? 'active',
+            current_period_end: periodEnd,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: 'user_id' }
+        )
     }
     return json({ received: true })
   }
 
   // -----------------------------------------------------------------------
-  // subscription.deleted  →  cancel / expire
+  // subscription.deleted  →  cancelled
   // -----------------------------------------------------------------------
-  if (
-    payload.type === 'subscription.deleted' ||
-    payload.event_type === 'subscription.deleted'
-  ) {
-    const sub = (payload.data ?? payload) as Record<string, unknown>
-    const metadata = (sub.metadata ?? {}) as Record<string, string>
-    const userId: string | undefined = metadata.user_id as string | undefined
+  if (eventType === 'subscription.deleted') {
+    const obj = (payload.object ?? payload.data ?? payload) as Record<string, unknown>
+    const metadata = (obj.metadata ?? {}) as Record<string, string>
+    const userId: string | undefined = metadata.user_id
 
     if (userId) {
-      await supabase.from('subscriptions').upsert(
-        {
-          user_id: userId,
-          status: 'canceled',
-          updated_at: new Date().toISOString(),
-        },
-        { onConflict: 'user_id' }
-      )
+      await supabase
+        .from('subscriptions')
+        .upsert(
+          {
+            user_id: userId,
+            status: 'canceled',
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: 'user_id' }
+        )
     }
     return json({ received: true })
   }
 
-  // Unknown event type — acknowledge receipt so Creem stops retrying
+  // Unknown event — acknowledge so Creem stops retrying
+  console.log('[creem-webhook] unhandled eventType:', eventType)
   return json({ received: true })
 }
